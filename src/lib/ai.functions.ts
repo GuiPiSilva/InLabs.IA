@@ -65,14 +65,14 @@ function readOutputText(interaction: any): string {
 function readOutputImage(interaction: any): { data: string; mimeType: string } {
   const direct = interaction?.output_image;
   if (direct?.data) {
-    return { data: direct.data, mimeType: direct.mime_type || "image/png" };
+    return { data: direct.data, mimeType: direct.mime_type || "image/jpeg" };
   }
 
   for (const step of interaction?.steps ?? []) {
     if (step?.type !== "model_output") continue;
     for (const block of step?.content ?? []) {
       if (block?.type === "image" && block?.data) {
-        return { data: block.data, mimeType: block.mime_type || "image/png" };
+        return { data: block.data, mimeType: block.mime_type || "image/jpeg" };
       }
     }
   }
@@ -205,7 +205,7 @@ Unique variation seed: ${data.seed}.`
         input: fullPrompt,
         response_format: {
           type: "image",
-          mime_type: "image/png",
+          mime_type: "image/jpeg",
           aspect_ratio: "1:1",
           image_size: "1K",
         },
