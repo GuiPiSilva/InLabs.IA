@@ -1,6 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
-import { GoogleGenAI } from "@google/genai";
 
 const CarrosselInput = z.object({
   theme: z.string().min(1),
@@ -17,10 +16,71 @@ interface SlideOut {
   imagePrompt: string;
 }
 
-async function callChat(messages: { role: string; content: string }[]): Promise<string> {
+async function geminiInteraction(payload: Record<string, unknown>) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY não configurada no servidor.");
 
+  const response = await fetch("https://generativelanguage.googleapis.com/v1/interactions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": apiKey,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const raw = await response.text();
+  let json: any;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    throw new Error(`Resposta inválida da Gemini (${response.status}).`);
+  }
+
+  if (!response.ok) {
+    const message = json?.error?.message || raw || `Erro ${response.status}`;
+    throw new Error(`${response.status} ${message}`);
+  }
+
+  return json;
+}
+
+function readOutputText(interaction: any): string {
+  if (typeof interaction?.output_text === "string" && interaction.output_text.trim()) {
+    return interaction.output_text.trim();
+  }
+
+  for (const step of interaction?.steps ?? []) {
+    if (step?.type !== "model_output") continue;
+    for (const block of step?.content ?? []) {
+      if (block?.type === "text" && typeof block.text === "string") {
+        return block.text.trim();
+      }
+    }
+  }
+
+  throw new Error("Resposta de texto vazia da Gemini.");
+}
+
+function readOutputImage(interaction: any): { data: string; mimeType: string } {
+  const direct = interaction?.output_image;
+  if (direct?.data) {
+    return { data: direct.data, mimeType: direct.mime_type || "image/png" };
+  }
+
+  for (const step of interaction?.steps ?? []) {
+    if (step?.type !== "model_output") continue;
+    for (const block of step?.content ?? []) {
+      if (block?.type === "image" && block?.data) {
+        return { data: block.data, mimeType: block.mime_type || "image/png" };
+      }
+    }
+  }
+
+  throw new Error("Imagem não retornada pela Gemini.");
+}
+
+async function callChat(messages: { role: string; content: string }[]): Promise<string> {
   const systemMessage = messages.find((message) => message.role === "system")?.content ?? "";
   const userMessages = messages
     .filter((message) => message.role !== "system")
@@ -28,9 +88,8 @@ async function callChat(messages: { role: string; content: string }[]): Promise<
     .join("\n\n");
 
   try {
-    const ai = new GoogleGenAI({ apiKey });
-    const interaction = await ai.interactions.create({
-      model: "gemini-3-flash-preview",
+    const interaction = await geminiInteraction({
+      model: "gemini-3.5-flash",
       input: `${systemMessage}\n\n${userMessages}\n\nRetorne somente JSON válido, sem markdown.`,
       response_format: {
         type: "text",
@@ -38,9 +97,7 @@ async function callChat(messages: { role: string; content: string }[]): Promise<
       },
     });
 
-    const output = interaction.output_text?.trim();
-    if (!output) throw new Error("Resposta vazia da Gemini.");
-    return output;
+    return readOutputText(interaction);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (/429|quota|rate limit/i.test(message)) {
@@ -143,21 +200,19 @@ Unique variation seed: ${data.seed}.`
       : `${data.prompt}. Cinematic full-bleed square 1:1 poster image, edge to edge, no frame, no slide mockup. Unique variation seed: ${data.seed}.`;
 
     try {
-      const ai = new GoogleGenAI({ apiKey });
-      const interaction = await ai.interactions.create({
+      const interaction = await geminiInteraction({
         model: "gemini-3.1-flash-image",
         input: fullPrompt,
         response_format: {
           type: "image",
+          mime_type: "image/png",
           aspect_ratio: "1:1",
           image_size: "1K",
         },
       });
 
-      const image = interaction.output_image;
-      if (!image?.data) throw new Error("Imagem não retornada pela Gemini.");
-      const mimeType = image.mime_type || "image/png";
-      return { dataUrl: `data:${mimeType};base64,${image.data}` };
+      const image = readOutputImage(interaction);
+      return { dataUrl: `data:${image.mimeType};base64,${image.data}` };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (/429|quota|rate limit/i.test(message)) throw new Error("Limite da Gemini API atingido.");
