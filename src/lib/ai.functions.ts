@@ -1,6 +1,5 @@
-mport { createServerFn } from "@tanstack/react-start";
+import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
-import { GoogleGenAI } from "@google/genai";
 
 const CarrosselInput = z.object({
   theme: z.string().min(1),
@@ -17,6 +16,23 @@ interface SlideOut {
   imagePrompt: string;
 }
 
+interface GeminiGenerateResponse {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{ text?: string }>;
+    };
+  }>;
+  error?: { message?: string };
+}
+
+interface PollinationsImageResponse {
+  data?: Array<{
+    b64_json?: string;
+    url?: string;
+  }>;
+  error?: { message?: string } | string;
+}
+
 async function callChat(messages: { role: string; content: string }[]): Promise<string> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY não configurada no servidor.");
@@ -27,22 +43,47 @@ async function callChat(messages: { role: string; content: string }[]): Promise<
     .map((message) => message.content)
     .join("\n\n");
 
-  try {
-    const ai = new GoogleGenAI({ apiKey });
-    const interaction = await ai.interactions.create({
-      model: "gemini-3-flash-preview",
-      input: `${systemMessage}\n\n${userMessages}\n\nRetorne somente JSON válido, sem markdown.`,
-      response_format: {
-        type: "text",
-        mime_type: "application/json",
-      },
-    });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
 
-    const output = interaction.output_text?.trim();
+  try {
+    const model = process.env.GEMINI_TEXT_MODEL || "gemini-2.5-flash";
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: `${systemMessage}\nRetorne somente JSON válido, sem markdown.` }],
+          },
+          contents: [{ role: "user", parts: [{ text: userMessages }] }],
+          generationConfig: {
+            responseMimeType: "application/json",
+            temperature: 0.9,
+          },
+        }),
+      },
+    );
+
+    const body = (await response.json()) as GeminiGenerateResponse;
+    if (!response.ok) {
+      throw new Error(body.error?.message || `Erro HTTP ${response.status}`);
+    }
+
+    const output = body.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text || "")
+      .join("")
+      .trim();
+
     if (!output) throw new Error("Resposta vazia da Gemini.");
     return output;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (/aborted|abort/i.test(message)) {
+      throw new Error("A Gemini demorou demais para responder. Tente novamente.");
+    }
     if (/429|quota|rate limit/i.test(message)) {
       throw new Error("Limite da Gemini API atingido. Tente novamente em instantes.");
     }
@@ -50,6 +91,8 @@ async function callChat(messages: { role: string; content: string }[]): Promise<
       throw new Error("Chave da Gemini inválida ou sem permissão.");
     }
     throw new Error(`Falha ao chamar a Gemini: ${message}`);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -66,9 +109,18 @@ Quantidade de slides: ${data.slides}
 Instruções extras: ${data.extra}
 Aleatoriedade (seed ${data.seed}): varie tom, exemplos e enquadramentos.`;
 
-    const raw = await callChat([{ role: "system", content: sys }, { role: "user", content: user }]);
+    const raw = await callChat([
+      { role: "system", content: sys },
+      { role: "user", content: user },
+    ]);
+
     let parsed: { slides: SlideOut[] };
-    try { parsed = JSON.parse(raw); } catch { throw new Error("Resposta da IA inválida"); }
+    try {
+      parsed = JSON.parse(raw) as { slides: SlideOut[] };
+    } catch {
+      throw new Error("Resposta da IA inválida");
+    }
+
     if (!Array.isArray(parsed.slides)) throw new Error("Resposta sem slides");
     return { slides: parsed.slides.slice(0, data.slides) };
   });
@@ -95,8 +147,17 @@ Local: ${data.place}
 Estilo: ${data.style}
 Extras: ${data.extra}
 Seed única: ${data.seed}`;
-    const raw = await callChat([{ role: "system", content: sys }, { role: "user", content: user }]);
-    return JSON.parse(raw) as SlideOut;
+
+    const raw = await callChat([
+      { role: "system", content: sys },
+      { role: "user", content: user },
+    ]);
+
+    try {
+      return JSON.parse(raw) as SlideOut;
+    } catch {
+      throw new Error("Resposta da IA inválida");
+    }
   });
 
 const ImageInput = z.object({
@@ -112,58 +173,109 @@ const ImageInput = z.object({
   style: z.string().optional().default(""),
 });
 
+function stringSeedToNumber(seed: string): number {
+  if (!seed) return Math.floor(Math.random() * 2_147_483_647);
+  let hash = 0;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = (hash * 31 + seed.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash) || 1;
+}
+
+async function imageUrlToDataUrl(url: string): Promise<string> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Falha ao baixar imagem: HTTP ${response.status}`);
+  const mimeType = response.headers.get("content-type") || "image/jpeg";
+  const bytes = Buffer.from(await response.arrayBuffer());
+  return `data:${mimeType};base64,${bytes.toString("base64")}`;
+}
+
 export const generateImage = createServerFn({ method: "POST" })
   .inputValidator((d: unknown) => ImageInput.parse(d))
   .handler(async ({ data }): Promise<{ dataUrl: string }> => {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) throw new Error("GEMINI_API_KEY não configurada no servidor.");
+    const apiKey = process.env.POLLINATIONS_API_KEY;
+    if (!apiKey) {
+      throw new Error("POLLINATIONS_API_KEY não configurada no servidor.");
+    }
 
     const hasText = (data.slideTitle || data.slideBody).trim().length > 0;
     const fullPrompt = hasText
-      ? `Create ONE single cinematic poster-style image (1:1, 1080x1080) — NOT a mockup, NOT a slide inside a frame, NOT a Canva/mLabs presentation preview, NOT a photo with a caption card next to it. The final result must look like a real finished advertising poster / editorial photograph where the typography is composited DIRECTLY over the photograph, edge-to-edge, with no white borders, no rounded card, no "slide X of Y" wrapper, no device frame.
+      ? `Create one finished square Instagram advertising poster, full bleed, edge to edge, not a mockup and not a slide inside a frame.
 
-RENDER THIS EXACT TEXT ON THE IMAGE (spelled correctly, in PORTUGUESE, no typos, no extra or invented words, no lorem ipsum):
-- HEADLINE (very large, bold, dominant typography, can span multiple lines): "${data.slideTitle}"
-${data.slideBody ? `- SUPPORTING COPY (smaller, clean sans-serif, secondary): "${data.slideBody}"` : ""}
+Portuguese headline: "${data.slideTitle}".
+${data.slideBody ? `Portuguese supporting copy: "${data.slideBody}".` : ""}
 
-DESIGN DIRECTION:
-- Full-bleed photographic background of the subject, shot like a professional ad campaign: cinematic lighting, shallow depth of field, rich contrast, realistic textures.
-- Typography sits ON TOP of the photo like a movie poster or magazine cover.
-- Visual style cue: ${data.style || "cinematic editorial poster"}
-- Color palette: ${data.palette || "rich, cohesive, high-contrast between headline and background"}
-${data.brand ? `- Small brand mark / handle discreetly placed in a corner: "${data.brand}"` : ""}
+Professional cinematic photographic background. Typography composited directly over the image. High readability, correct Portuguese spelling, no extra words, no watermark, no border, no device frame.
+Visual style: ${data.style || "cinematic editorial advertising poster"}.
+Color palette: ${data.palette || "cohesive high contrast palette"}.
+${data.brand ? `Small discreet brand name in a corner: "${data.brand}".` : ""}
+Scene: ${data.prompt}.
+Variation seed: ${data.seed}.`
+      : `${data.prompt}. Professional cinematic square Instagram image, full bleed, edge to edge, no border, no mockup, no watermark. Variation seed: ${data.seed}.`;
 
-STRICT RULES:
-- The image IS the final poster. No surrounding card, frame, slide badge, border, page mockup or watermark.
-- No gibberish letters and no duplicated text.
-- Square 1:1, full-bleed to the edges.
-
-Photographic subject / scene: ${data.prompt}
-Unique variation seed: ${data.seed}.`
-      : `${data.prompt}. Cinematic full-bleed square 1:1 poster image, edge to edge, no frame, no slide mockup. Unique variation seed: ${data.seed}.`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120_000);
 
     try {
-      const ai = new GoogleGenAI({ apiKey });
-      const interaction = await ai.interactions.create({
-        model: "gemini-3.1-flash-image",
-        input: fullPrompt,
-        response_format: {
-          type: "image",
-          aspect_ratio: "1:1",
-          image_size: "1K",
+      const model = process.env.POLLINATIONS_IMAGE_MODEL || "zimage";
+      const response = await fetch("https://gen.pollinations.ai/v1/images/generations", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
         },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model,
+          prompt: fullPrompt,
+          n: 1,
+          size: "1024x1024",
+          response_format: "b64_json",
+          seed: stringSeedToNumber(data.seed),
+        }),
       });
 
-      const image = interaction.output_image;
-      if (!image?.data) throw new Error("Imagem não retornada pela Gemini.");
-      const mimeType = image.mime_type || "image/png";
-      return { dataUrl: `data:${mimeType};base64,${image.data}` };
+      const rawText = await response.text();
+      let result: PollinationsImageResponse = {};
+      try {
+        result = JSON.parse(rawText) as PollinationsImageResponse;
+      } catch {
+        // Mantém o texto bruto para a mensagem de erro abaixo.
+      }
+
+      if (!response.ok) {
+        const apiMessage =
+          typeof result.error === "string"
+            ? result.error
+            : result.error?.message || rawText || `Erro HTTP ${response.status}`;
+        throw new Error(apiMessage);
+      }
+
+      const image = result.data?.[0];
+      if (image?.b64_json) {
+        return { dataUrl: `data:image/jpeg;base64,${image.b64_json}` };
+      }
+      if (image?.url) {
+        return { dataUrl: await imageUrlToDataUrl(image.url) };
+      }
+
+      throw new Error("A Pollinations não retornou a imagem.");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (/429|quota|rate limit/i.test(message)) throw new Error("Limite da Gemini API atingido.");
-      if (/401|403|api.?key|permission|unauthorized|forbidden/i.test(message)) {
-        throw new Error("Chave da Gemini inválida ou sem permissão para gerar imagens.");
+      if (/aborted|abort/i.test(message)) {
+        throw new Error("A Pollinations demorou demais para gerar a imagem.");
       }
-      throw new Error(`Falha ao gerar imagem com a Gemini: ${message}`);
+      if (/401|unauthorized|invalid.?key/i.test(message)) {
+        throw new Error("Chave da Pollinations inválida.");
+      }
+      if (/402|payment|required|balance|pollen|credit/i.test(message)) {
+        throw new Error("Saldo da Pollinations insuficiente para gerar a imagem.");
+      }
+      if (/429|rate limit/i.test(message)) {
+        throw new Error("Limite de requisições da Pollinations atingido. Tente novamente.");
+      }
+      throw new Error(`Falha ao gerar imagem com a Pollinations: ${message}`);
+    } finally {
+      clearTimeout(timeout);
     }
   });
